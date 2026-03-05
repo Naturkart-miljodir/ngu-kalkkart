@@ -1,0 +1,1 @@
+This code (ArcGIS Pro jupyter notebook) is used to create the water mask from the FBK database. 

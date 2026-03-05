@@ -1,0 +1,2 @@
+Here we have two codes designed for national and local (in this case labeled as "trondelag") tests. The codes create deep-learning "chips" (used the term
+"tiles", which can be a bit misleading) for training/testing of the U-Net model
