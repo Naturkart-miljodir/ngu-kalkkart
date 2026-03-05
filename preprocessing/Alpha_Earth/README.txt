@@ -1,0 +1,3 @@
+This code goes through each Alpha Earth tile, mask it for water, de-quantize (data original in Int8 but converted to float32), and saves the tiles as 64 band geotif. Then, a VRT is created so the DL chip creation is faster. A one band COG of band 1 is created for visual inspection.
+
+See de-quantize formula in the code. This (data and de-quantize formula) was provided with Alpha Earth data by (MDir)
