@@ -1,0 +1,38 @@
+// Local VS Code Extension Recommendations
+{
+  "recommendations": [
+    // Python extensions
+    "ms-python.python",
+    "ms-python.debugpy",
+    "ms-python.vscode-pylance",
+    "ms-python.mypy-type-checker",
+
+    // Jupyter Notebooks
+    "ms-toolsai.jupyter",
+    "RandomFractalsInc.vscode-data-table",
+
+    // Git and Version Control
+    "mhutchie.git-graph",
+    "donjayamanne.githistory",
+
+    // File support and linters
+    "tamasfe.even-better-toml",
+    "samuelcolvin.jinjahtml",
+    "redhat.vscode-yaml",
+    "prettier.prettier-vscode",
+    "charliermarsh.ruff", // python
+    "njpwerner.autodocstring", // python
+    "DavidAnson.vscode-markdownlint",
+    "yzhang.markdown-all-in-one",
+    "bierner.markdown-mermaid",
+
+    // Data tools
+    "ms-toolsai.datawrangler",
+
+    // SSH and Remote Development
+    "ms-vscode-remote.vscode-remote-extensionpack",
+
+    // Container Development
+    "ms-azuretools.vscode-containers"
+  ]
+}
