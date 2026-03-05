@@ -31,7 +31,7 @@ except Exception:
 from sklearn.model_selection import train_test_split, KFold
 from keras.layers import Conv2D, MaxPooling2D, UpSampling2D, Input, Concatenate, Dropout
 from keras.models import Model
-from keras.callbacks import Callback, ModelCheckpoint
+from keras.callbacks import Callback, ModelCheckpoint, TerminateOnNaN
 import matplotlib.pyplot as plt
 
 # Add zlib path for Windows (fixes zlibwapi.dll error)
@@ -94,14 +94,31 @@ print("=" * 70)
 print()
 
 # =====================================================================
+# DISTRIBUTED TRAINING STRATEGY
+# =====================================================================
+if len(gpus) > 1:
+    strategy = tf.distribute.MirroredStrategy()
+    print(f"Using MirroredStrategy across {strategy.num_replicas_in_sync} GPUs")
+else:
+    strategy = tf.distribute.get_strategy()
+    print(f"Using default strategy with {strategy.num_replicas_in_sync} replica")
+
+BATCH_SIZE_PER_REPLICA = 1
+GLOBAL_BATCH_SIZE = BATCH_SIZE_PER_REPLICA * strategy.num_replicas_in_sync
+print(f"Batch size per replica: {BATCH_SIZE_PER_REPLICA}")
+print(f"Global batch size: {GLOBAL_BATCH_SIZE}")
+print()
+
+# =====================================================================
 # 0. USER SWITCHES & DEFAULT ADVANCED LOSS PARAMETERS
 # =====================================================================
 
 DO_SPATIAL_CV = True
 N_FOLDS       = 3
-DO_MAIN_TRAIN = False
+DO_MAIN_TRAIN = True
 CV_EPOCHS     = 5
-LEARNING_RATE = 1e-4
+MAIN_EPOCHS   = 40
+LEARNING_RATE = 5e-5
 CLASS2_WEIGHT_MULTIPLIER = 1.8
 
 # UNCERTAINTY QUANTIFICATION
@@ -144,9 +161,9 @@ print()
 # 1. Paths
 # =====================================================================
 
-TILE_DIR  = r"E:\Test\National_test\DL_tiles_25pct"
-MODEL_OUT = r"E:\Test\National_test\Modelling_25pct\Models"
-QC_PLOTS  = r"E:\Test\National_test\Modelling_25pct\QC_plots"
+TILE_DIR  = r"/home/acosta_pedro/DL_tiles"
+MODEL_OUT = r"/home/acosta_pedro/outputs/Models"
+QC_PLOTS  = r"/home/acosta_pedro/outputs/QC_plots"
 
 X_dir = os.path.join(TILE_DIR, "X")
 y_dir = os.path.join(TILE_DIR, "y")
@@ -236,6 +253,17 @@ else:
     print(f"[INFO] No NaN values found in data.")
 
 print(f"[INFO] Data is already normalized. No additional standardization applied.")
+
+# Stabilize extreme outliers to reduce NaN risk during distributed training
+if valid_data_mask.any():
+    valid_vals = X[valid_data_mask]
+    clip_low = np.percentile(valid_vals, 0.1)
+    clip_high = np.percentile(valid_vals, 99.9)
+    X = np.clip(X, clip_low, clip_high)
+    print(f"[INFO] Clipped X to robust range [{clip_low:.4f}, {clip_high:.4f}] for training stability.")
+else:
+    print("[WARNING] No valid pixels found for robust clipping; skipping clip step.")
+
 print(f"[INFO] After preprocessing - has NaN: {np.isnan(X).any()}, range: [{np.min(X):.4f}, {np.max(X):.4f}]")
 print(f"[INFO] Valid data mask will be applied to uncertainty outputs.")
 
@@ -594,18 +622,28 @@ def save_uncertainty_maps(mean_pred, std_pred, entropy, fold_idx, data_type="cv"
 # CREATE tf.data.Dataset for efficient GPU data streaming
 # =====================================================================
 
-def create_dataset(X, y, batch_size=2, shuffle=True):
-    """Convert numpy arrays to tf.data.Dataset for efficient GPU streaming."""
-    # Cast to tf.float32 explicitly to avoid mixed dtype issues
-    X = X.astype(np.float32)
-    y = y.astype(np.float32)  # Note: y will be cast to int32 in loss functions
-    
-    dataset = tf.data.Dataset.from_tensor_slices((X, y))
-    
-    if shuffle:
-        dataset = dataset.shuffle(buffer_size=min(1000, len(X)))  # Reasonable buffer
-    
-    dataset = dataset.batch(batch_size)
+def create_dataset(X, y, batch_size=GLOBAL_BATCH_SIZE, shuffle=True, drop_remainder=True):
+    """Create streaming tf.data.Dataset to avoid huge tensor copies to GPU."""
+    x_shape = tuple(X.shape[1:])
+    y_shape = tuple(y.shape[1:])
+
+    def sample_generator():
+        indices = np.arange(len(X))
+        if shuffle:
+            np.random.shuffle(indices)
+        for idx in indices:
+            yield X[idx].astype(np.float32, copy=False), y[idx].astype(np.float32, copy=False)
+
+    dataset = tf.data.Dataset.from_generator(
+        sample_generator,
+        output_signature=(
+            tf.TensorSpec(shape=x_shape, dtype=tf.float32),
+            tf.TensorSpec(shape=y_shape, dtype=tf.float32),
+        ),
+    )
+
+    dataset = dataset.repeat()
+    dataset = dataset.batch(batch_size, drop_remainder=drop_remainder)
     dataset = dataset.prefetch(tf.data.AUTOTUNE)  # Auto-tune prefetching
     
     return dataset
@@ -631,8 +669,10 @@ if DO_SPATIAL_CV:
         # Debug: check for NaN before training
         print(f"  [DEBUG CV FOLD {fold}] Xva after split - has NaN: {np.isnan(Xva).any()}, range: [{np.nanmin(Xva):.4f}, {np.nanmax(Xva):.4f}]")
 
-        model = build_unet(X.shape[1:], num_classes)
-        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE), loss=LOSS_FUNCTION, metrics=[masked_accuracy])
+        with strategy.scope():
+            model = build_unet(X.shape[1:], num_classes)
+            optimizer = tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE, clipnorm=1.0)
+            model.compile(optimizer=optimizer, loss=LOSS_FUNCTION, metrics=[masked_accuracy])
 
         ckpt = ModelCheckpoint(os.path.join(MODEL_OUT, f"unet_cv_fold{fold}.keras"),
                                monitor="val_loss", save_best_only=True)
@@ -641,14 +681,18 @@ if DO_SPATIAL_CV:
         f1cb = F1MetricsCallback(Xva, yva, f1_log, prefix=f"CV Fold {fold}")
 
         # Create tf.data.Dataset for efficient GPU streaming
-        train_dataset = create_dataset(Xtr, ytr, batch_size=2, shuffle=True)
-        val_dataset = create_dataset(Xva, yva, batch_size=2, shuffle=False)
+        train_dataset = create_dataset(Xtr, ytr, batch_size=GLOBAL_BATCH_SIZE, shuffle=True, drop_remainder=True)
+        val_dataset = create_dataset(Xva, yva, batch_size=GLOBAL_BATCH_SIZE, shuffle=False, drop_remainder=True)
+        train_steps = max(1, len(Xtr) // GLOBAL_BATCH_SIZE)
+        val_steps = max(1, len(Xva) // GLOBAL_BATCH_SIZE)
 
         model.fit(
             train_dataset,
             validation_data=val_dataset,
             epochs=CV_EPOCHS,
-            callbacks=[ckpt, f1cb],
+            steps_per_epoch=train_steps,
+            validation_steps=val_steps,
+            callbacks=[ckpt, f1cb, TerminateOnNaN()],
             verbose=1
         )
         
@@ -676,8 +720,10 @@ if DO_MAIN_TRAIN:
     Xva_clean = Xva.copy()
     print(f"  [DEBUG MAIN] Xva after split - has NaN: {np.isnan(Xva).any()}, range: [{np.nanmin(Xva):.4f}, {np.nanmax(Xva):.4f}]")
 
-    model = build_unet(X.shape[1:], num_classes)
-    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE), loss=LOSS_FUNCTION, metrics=[masked_accuracy])
+    with strategy.scope():
+        model = build_unet(X.shape[1:], num_classes)
+        optimizer = tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE, clipnorm=1.0)
+        model.compile(optimizer=optimizer, loss=LOSS_FUNCTION, metrics=[masked_accuracy])
 
     ckpt = ModelCheckpoint(os.path.join(MODEL_OUT, "unet_best_model.keras"),
                            monitor="val_loss", save_best_only=True)
@@ -686,14 +732,18 @@ if DO_MAIN_TRAIN:
     f1cb = F1MetricsCallback(Xva, yva, f1_main_log, prefix="MAIN")
 
     # Create tf.data.Dataset for efficient GPU streaming
-    train_dataset = create_dataset(Xtr, ytr, batch_size=2, shuffle=True)
-    val_dataset = create_dataset(Xva, yva, batch_size=2, shuffle=False)
+    train_dataset = create_dataset(Xtr, ytr, batch_size=GLOBAL_BATCH_SIZE, shuffle=True, drop_remainder=True)
+    val_dataset = create_dataset(Xva, yva, batch_size=GLOBAL_BATCH_SIZE, shuffle=False, drop_remainder=True)
+    train_steps = max(1, len(Xtr) // GLOBAL_BATCH_SIZE)
+    val_steps = max(1, len(Xva) // GLOBAL_BATCH_SIZE)
 
     history = model.fit(
         train_dataset,
         validation_data=val_dataset,
-        epochs=40,
-        callbacks=[ckpt, f1cb],
+        epochs=MAIN_EPOCHS,
+        steps_per_epoch=train_steps,
+        validation_steps=val_steps,
+        callbacks=[ckpt, f1cb, TerminateOnNaN()],
         verbose=1
     )
 
