@@ -1,13 +1,15 @@
 // Local VS Code Extension Configurations
 // Not used by Devcontainer instead configs are listed in .devcontainer/devcontainer.json
 {
-  // Editor rulers
+  // Terminal
+  "terminal.integrated.defaultProfile.windows": "Command Prompt",
+  "terminal.integrated.defaultProfile.linux": "Bash",
+
+  // Profiles, Editors, and Themes
   "editor.rulers": [
     { "column": 88, "color": "#737171" },
   ],
   "editor.tabSize": 2,
-
-  // Color customizations (Default Dark Theme)
   "workbench.colorCustomizations": {
     "activityBar.background": "#181818",
     "titleBar.activeBackground": "#181818",
@@ -19,16 +21,11 @@
     "editor.defaultFormatter": "charliermarsh.ruff",
     "editor.formatOnSave": true,
   },
-  // Python linting/formatting with Ruff
   "ruff.interpreter": [
     ".venv/Scripts/python",
     ".venv/bin/python",
   ],
-
-  // Python Docstrings
   "autoDocstring.docstringFormat": "one-line-sphinx",
-  
-  // Python other settings
   "python.useEnvironmentsExtension": false, // Use Python Envy instead
 
   // YAML formatting
@@ -65,7 +62,8 @@
   // Git
   "git.branchProtection": ["main"],
   "git.allowNoVerifyCommit": true,
-
+  "git.confirmNoVerifyCommit": false,
+  
   // Docker
   "containers.contexts.showInStatusBar": true,
   
