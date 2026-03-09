@@ -30,10 +30,11 @@ if os.name == "nt":
 else:
     PROJECT_DIR = windows_path_to_wsl(PROJECT_DIR_WINDOWS)
 
-PREDICTOR_DIR = os.path.join(PROJECT_DIR, "Modelling", "Covariates_to_model")
-POLYGON_SHP = os.path.join(PROJECT_DIR, "Naturtype", "NordTrond_Train_MDir_ed.shp")
-SNAP_RASTER = os.path.join(PROJECT_DIR, "Mask", "Mask_10m_NortdTrond.tif")
-OUT_DIR = os.path.join(PROJECT_DIR, "Modelling", "RandForest")
+PREDICTOR_DIR = r"C:\Users\acosta_pedro\OneDrive - Norges geologiske undersøkelse\Geochemistry NGU_2026\Kalk_project\Modelling\Covariates_to_model"
+POLYGON_SHP = r"C:\Users\acosta_pedro\Miljødirektoratet\Endre Grüner Ofstad - kalkkart\Data\kalkkart_treningsdata.gpkg"
+POLYGON_LAYER = "NiN_all_agg"
+SNAP_RASTER = r"E:\Alpha_earth\qc\alphaearth_mosaic_epsg25833_band1_qc_cog.tif"
+OUT_DIR = r"C:\Users\acosta_pedro\OneDrive - Norges geologiske undersøkelse\Geochemistry NGU_2026\Kalk_project\Modelling\RandForest\Regression"
 MATRIX_PATH = os.path.join(OUT_DIR, "regression_matrix.npz")
 
 LABEL_FIELD = "KA_3Class"
@@ -58,7 +59,7 @@ if len(var_names) == 0:
 
 print(f"Loaded {len(var_names)} predictors")
 
-gdf = gpd.read_file(POLYGON_SHP)
+gdf = gpd.read_file(POLYGON_SHP, layer=POLYGON_LAYER)
 if gdf.crs != crs:
     gdf = gdf.to_crs(crs)
 
@@ -107,10 +108,19 @@ for i in tqdm(range(n_labeled)):
             valid = False
             break
 
-        nodata = ds.nodatavals[0]
-        if nodata is not None and (np.isnan(val) or val == nodata):
+        if not np.isfinite(val):
             valid = False
             break
+
+        nodata = ds.nodatavals[0]
+        if nodata is not None:
+            if np.isnan(nodata):
+                if np.isnan(val):
+                    valid = False
+                    break
+            elif val == nodata:
+                valid = False
+                break
 
         pixel_features.append(float(val))
 
