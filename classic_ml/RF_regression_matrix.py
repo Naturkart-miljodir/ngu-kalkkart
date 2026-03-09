@@ -1,5 +1,5 @@
 """
-Build Regression Matrix for Kalk RF workflow
+Build Regression Matrix for Kalk RF workflow.
 - Loads predictors and training polygons
 - Rasterizes labels
 - Extracts predictor values for labeled pixels
