@@ -20,7 +20,6 @@
   // UV PATH WINDOWS: ${workspaceFolder}/.venv/Scripts/python
   // UV PATH LINUX/MAC: ${workspaceFolder}/.venv/bin/python
   "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
-  "mypy-type-checker.interpreter": ["${workspaceFolder}/.venv/bin/python"],
 
   "[python]": {
     "editor.defaultFormatter": "charliermarsh.ruff" // vscode ruff extension
@@ -31,5 +30,7 @@
   "python.testing.pytestArgs": ["tests"],
   "python.testing.cwd": "${workspaceFolder}",
   "notebook.formatOnSave.enabled": true,
-  "ruff.organizeImports": true
+  "ruff.organizeImports": true,
+  "python-envs.defaultEnvManager": "ms-python.python:conda",
+  "python-envs.defaultPackageManager": "ms-python.python:conda"
 }
