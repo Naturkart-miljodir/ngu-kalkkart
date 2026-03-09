@@ -1,36 +1,70 @@
-// VS Code Configurations
+// Local VS Code Extension Configurations
+// Not used by Devcontainer instead configs are listed in .devcontainer/devcontainer.json
 {
-  // Git
-  // "git.branchProtection": ["main"],
+  // Terminal
+  "terminal.integrated.defaultProfile.windows": "Command Prompt",
+  "terminal.integrated.defaultProfile.linux": "Bash",
 
-  // General editor settings
-  "editor.defaultFormatter": "prettier.prettier-vscode", // vscode prettier extension
-  "editor.formatOnSave": true,
+  // Profiles, Editors, and Themes
   "editor.rulers": [
-    { "column": 78, "color": "#737171" },
-    { "column": 88, "color": "#2affa3" }
+    { "column": 88, "color": "#737171" },
   ],
+  "editor.tabSize": 2,
+  "workbench.colorCustomizations": {
+    "activityBar.background": "#181818",
+    "titleBar.activeBackground": "#181818",
+    "titleBar.activeForeground": "#cccccc"
+  },  
 
-  // Markdown (yzhang.markdown-all-in-one)
+  // Python formatting
+  "[python]": {
+    "editor.defaultFormatter": "charliermarsh.ruff",
+    "editor.formatOnSave": true,
+  },
+  "ruff.interpreter": [
+    ".venv/Scripts/python",
+    ".venv/bin/python",
+  ],
+  "autoDocstring.docstringFormat": "one-line-sphinx",
+  "python.useEnvironmentsExtension": false, // Use Python Envy instead
+
+  // YAML formatting
+  "[yaml]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode",
+    "editor.formatOnSave": true,
+    "editor.tabSize": 2
+  },
+  "[yml]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode",
+    "editor.formatOnSave": true,
+    "editor.tabSize": 2
+  },
+
+  // TOML formatting
+  "[toml]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode",
+    "editor.formatOnSave": true,
+    "editor.tabSize": 2
+  },
+  "evenBetterToml.formatter.allowedBlankLines": 2,
+
+  // Markdown formatting
+  "[markdown]":{
+    "editor.defaultFormatter": "esbenp.prettier-vscode",
+    "editor.formatOnSave": true,
+    "editor.tabSize": 2
+  },
+
+  // Markdown Table of Contents settings
   "markdown.extension.toc.levels": "2..2",
   "markdown.extension.toc.updateOnSave": true,
-  "markdown.extension.toc.orderedList": true,
 
-  // Python settings
-  // UV PATH WINDOWS: ${workspaceFolder}/.venv/Scripts/python
-  // UV PATH LINUX/MAC: ${workspaceFolder}/.venv/bin/python
-  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
-
-  "[python]": {
-    "editor.defaultFormatter": "charliermarsh.ruff" // vscode ruff extension
-  },
-  "autoDocstring.docstringFormat": "one-line-sphinx",
-  "python.testing.pytestEnabled": true,
-  "python.testing.unittestEnabled": false,
-  "python.testing.pytestArgs": ["tests"],
-  "python.testing.cwd": "${workspaceFolder}",
-  "notebook.formatOnSave.enabled": true,
-  "ruff.organizeImports": true,
-  "python-envs.defaultEnvManager": "ms-python.python:conda",
-  "python-envs.defaultPackageManager": "ms-python.python:conda"
+  // Git
+  "git.branchProtection": ["main"],
+  "git.allowNoVerifyCommit": true,
+  "git.confirmNoVerifyCommit": false,
+  
+  // Docker
+  "containers.contexts.showInStatusBar": true,
+  
 }
