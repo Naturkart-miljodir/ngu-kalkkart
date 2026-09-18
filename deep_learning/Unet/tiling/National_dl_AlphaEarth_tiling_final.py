@@ -1,9 +1,9 @@
 """
-National DL tiling for AlphaEarth run.
+National DL tiling for AlphaEarth run (final version).
 
 Rules:
-1) Uses only AlphaEarth, topographic, and categorical inputs.
-2) Z-score normalize ONLY topographic predictors.
+1) Uses only AlphaEarth, topographic, categorical, and coordinate inputs.
+2) Z-score normalize topographic predictors and coordinate predictors (coord_x/coord_y).
 3) Keep these raw (no normalization):
    - alphaearth_dequant_national_epsg25833.vrt
    - landuse_Code_18_cog
@@ -18,10 +18,13 @@ import csv
 import glob
 import random
 import time
+from typing import Optional
 import numpy as np
 import rasterio
 import geopandas as gpd
 from datetime import datetime, timedelta
+from rasterio.enums import Resampling
+from rasterio.vrt import WarpedVRT
 
 from tqdm import tqdm
 from shapely.geometry import box
@@ -31,14 +34,14 @@ from rasterio.features import rasterize
 # ============================================================
 # USER PATHS - NATIONAL ALPHAEARTH
 # ============================================================
-PREDICTOR_DIR = r"C:\Users\acosta_pedro\OneDrive - Norges geologiske undersøkelse\Geochemistry NGU_2026\Kalk_project\Modelling\Covariates_to_model"
-POLYGON_GPKG = r"C:\Users\acosta_pedro\Miljødirektoratet\Endre Grüner Ofstad - kalkkart\Data\kalkkart_treningsdata.gpkg"
-POLYGON_LAYER = "NiN_all_agg"
-OUT_DIR = r"C:\Users\acosta_pedro\OneDrive - Norges geologiske undersøkelse\Geochemistry NGU_2026\Kalk_project\Modelling\DL_AE_chips"
-TILE_METADATA_DIR = r"C:\Users\acosta_pedro\OneDrive - Norges geologiske undersøkelse\Geochemistry NGU_2026\Kalk_project\Modelling\DL_chips_spatial_location"
+PREDICTOR_DIR = r"G:\Covariates_to_model"
+POLYGON_GPKG = r"C:\Users\acosta_pedro\OneDrive - Norges geologiske undersøkelse\Geochemistry NGU_2025\kalk_prosjekt3.0\MDir_data\Data_2026\kalkkart_treningsdata_ed_June2026.gpkg"
+POLYGON_LAYER = "NiN_all_agg_clean"
+OUT_DIR = r"D:\DL_AE_chips\Clean_data_ed_3"
+TILE_METADATA_DIR = os.path.join(OUT_DIR, "tile_metadata")
 
 # Reference grid (snap raster with water as NoData)
-REF_MASK = r"E:\Alpha_earth\qc\alphaearth_mosaic_epsg25833_band1_qc_cog.tif"
+REF_MASK = r"G:\Covariates_to_model\Topo_dtm_ch.tif"
 
 # AlphaEarth source tile folder (used to patch VRT source paths to absolute)
 ALPHAEARTH_DIR = r"E:\Alpha_earth\dequant_images_all"
@@ -46,23 +49,23 @@ ALPHAEARTH_DIR = r"E:\Alpha_earth\dequant_images_all"
 LABEL_FIELD = "KA_mean_weighted_category"
 BACKGROUND_VALUE = 0
 
-# Do NOT normalize these predictors
-NON_NORMALIZED_PREDICTOR_STEMS = {
-    "alphaearth_dequant_national_epsg25833",
-    "landuse_code_18_cog",
-    "geology_ca_icp_coe_cog",
-    "geology_logca_icp_cog",
-    "geol_ca_cog",
-    "marine_limit_cog",
-    "quaternary_cog",
-    "quaternary_forenkletk_cog",
-}
+# Normalize only predictors whose names include one of these substrings.
+# Matching is case-sensitive and checks the original filename stem.
+NORMALIZE_IF_NAME_CONTAINS = (
+    "Topo_",
+    "Geophys_",
+    "xgb_prediction_CaO_",
+    "xgb_prediction_KESP_",
+    "coord_",
+    "Coord_",
+)
 
 # ============================================================
 # TILE SETTINGS
 # ============================================================
 TILE_SIZE = 128
-MIN_LABEL_RATIO = 0.15
+MIN_LABEL_RATIO = 0.05  # Custom value
+STRIDE = int(0.8 * TILE_SIZE)  # Custom stride
 
 # Z-score estimation for topographic rasters only
 Z_N_SAMPLES_PER_RASTER = 2_000_000
@@ -73,6 +76,12 @@ RANDOM_SEED = 42
 np.random.seed(RANDOM_SEED)
 random.seed(RANDOM_SEED)
 
+# End-of-run visual QA previews
+PREVIEW_COUNT = 3
+PREVIEW_BANDS_1BASED = [1, 40, 64]
+PREVIEW_ALPHA = 0.40
+PREVIEW_DIR = os.path.join(OUT_DIR, "chip_previews")
+
 # ============================================================
 # OUTPUT FOLDERS
 # ============================================================
@@ -82,12 +91,15 @@ os.makedirs(X_DIR, exist_ok=True)
 os.makedirs(Y_DIR, exist_ok=True)
 os.makedirs(TILE_METADATA_DIR, exist_ok=True)
 
-
 # ============================================================
 # HELPERS
 # ============================================================
 def predictor_stem(path: str) -> str:
     return os.path.splitext(os.path.basename(path))[0].lower()
+
+
+def predictor_stem_raw(path: str) -> str:
+    return os.path.splitext(os.path.basename(path))[0]
 
 
 def canonical_predictor_stem(path: str) -> str:
@@ -97,33 +109,27 @@ def canonical_predictor_stem(path: str) -> str:
     return stem
 
 
+def canonical_predictor_stem_raw(path: str) -> str:
+    stem = predictor_stem_raw(path)
+    if stem.endswith("_absolute_paths"):
+        return stem[: -len("_absolute_paths")]
+    return stem
+
+
 def predictor_group(path: str) -> str:
     stem = canonical_predictor_stem(path)
+    stem_raw = canonical_predictor_stem_raw(path)
     if stem == "alphaearth_dequant_national_epsg25833":
         return "alphaearth"
-    if stem in {
-        "landuse_code_18_cog",
-        "geol_ca_cog",
-        "marine_limit_cog",
-        "quaternary_cog",
-        "quaternary_forenkletk_cog",
-        "geology_ca_icp_coe_cog",
-        "geology_logca_icp_cog",
-    }:
-        return "categorical"
-    return "topographic"
+    if any(tag in stem_raw for tag in NORMALIZE_IF_NAME_CONTAINS):
+        return "topographic"
+    return "other"
 
 
 def should_normalize(path: str) -> bool:
-    # Only topographic predictors are normalized.
-    stem = predictor_stem(path)
-    if stem in NON_NORMALIZED_PREDICTOR_STEMS:
-        return False
-    if stem.endswith("_absolute_paths"):
-        original_stem = stem[: -len("_absolute_paths")]
-        if original_stem in NON_NORMALIZED_PREDICTOR_STEMS:
-            return False
-    return True
+    # Normalize only predictors with explicit name patterns.
+    stem = canonical_predictor_stem_raw(path)
+    return any(tag in stem for tag in NORMALIZE_IF_NAME_CONTAINS)
 
 
 def assert_same_grid(ds_a, ds_b, name_a="A", name_b="B"):
@@ -226,6 +232,79 @@ def format_seconds(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+def save_preview_png(tile_name: str, band_1based: int, out_png: str):
+    """
+    Save one visual QA PNG for a tile: grayscale predictor band + class overlay.
+
+    NaN pixels are rendered as white for quick visual checks.
+    """
+    import matplotlib.pyplot as plt
+
+    x_path = os.path.join(X_DIR, f"{tile_name}.npy")
+    y_path = os.path.join(Y_DIR, f"{tile_name}.npy")
+    X = np.load(x_path)
+    y = np.load(y_path)
+
+    band_idx = max(0, min(band_1based - 1, X.shape[0] - 1))
+    band = X[band_idx].astype(np.float32)
+
+    finite = np.isfinite(band)
+    if np.any(finite):
+        vmin = float(np.percentile(band[finite], 2))
+        vmax = float(np.percentile(band[finite], 98))
+        if vmax <= vmin:
+            vmax = vmin + 1e-6
+        gray = np.clip((band - vmin) / (vmax - vmin), 0.0, 1.0)
+    else:
+        gray = np.zeros_like(band, dtype=np.float32)
+
+    rgb = np.stack([gray, gray, gray], axis=-1)
+    rgb[~finite] = 1.0  # NaN -> white
+
+    class_colors = {
+        1: np.array([0.20, 0.75, 0.20], dtype=np.float32),
+        2: np.array([0.98, 0.75, 0.25], dtype=np.float32),
+        3: np.array([0.90, 0.25, 0.25], dtype=np.float32),
+    }
+
+    overlay = rgb.copy()
+    for cls, color in class_colors.items():
+        m = y == cls
+        if np.any(m):
+            overlay[m] = (1.0 - PREVIEW_ALPHA) * overlay[m] + PREVIEW_ALPHA * color
+
+    plt.figure(figsize=(5, 5), dpi=150)
+    plt.imshow(overlay)
+    plt.axis("off")
+    plt.tight_layout(pad=0)
+    plt.savefig(out_png, bbox_inches="tight", pad_inches=0)
+    plt.close()
+
+
+def create_end_run_previews(tile_names):
+    """
+    Create a small set of preview PNGs for visual confirmation.
+    """
+    if not tile_names:
+        print("Preview PNGs skipped: no tiles created.")
+        return []
+
+    os.makedirs(PREVIEW_DIR, exist_ok=True)
+    n = min(PREVIEW_COUNT, len(tile_names))
+    sampled = random.sample(tile_names, k=n)
+
+    preview_files = []
+    for i, tile_name in enumerate(sampled, start=1):
+        desired_band = PREVIEW_BANDS_1BASED[(i - 1) % len(PREVIEW_BANDS_1BASED)]
+        out_png = os.path.join(
+            PREVIEW_DIR,
+            f"preview_{i:02d}_{tile_name}_band{desired_band:02d}.png",
+        )
+        save_preview_png(tile_name=tile_name, band_1based=desired_band, out_png=out_png)
+        preview_files.append(out_png)
+
+    return preview_files
+
 # ============================================================
 # LOAD REFERENCE GRID
 # ============================================================
@@ -255,19 +334,71 @@ predictor_paths = find_predictors(PREDICTOR_DIR)
 patched_paths = []
 for p in predictor_paths:
     if os.path.basename(p).lower() == "alphaearth_dequant_national_epsg25833.vrt":
-        p = make_vrt_absolute(p, ALPHAEARTH_DIR, OUT_DIR)
-        print(f"Patched AlphaEarth VRT: {p}")
+        original_vrt = p
+        patched_vrt = make_vrt_absolute(original_vrt, ALPHAEARTH_DIR, OUT_DIR)
+        use_patched = True
+        try:
+            with rasterio.open(patched_vrt) as ds_test:
+                if (
+                    ds_test.crs != ref_ds.crs
+                    or ds_test.transform != ref_ds.transform
+                    or ds_test.width != ref_ds.width
+                    or ds_test.height != ref_ds.height
+                ):
+                    use_patched = False
+        except Exception as e:
+            print(f"Patched AlphaEarth VRT open failed, using original VRT: {e}")
+            use_patched = False
+
+        if use_patched:
+            p = patched_vrt
+            print(f"Patched AlphaEarth VRT: {p}")
+        else:
+            p = original_vrt
+            print("Patched AlphaEarth VRT grid mismatch; using original VRT instead.")
     patched_paths.append(p)
 
 predictor_paths = patched_paths
 
 predictors = []
+normalized_predictor_files = []
+raw_predictor_files = []
 for p in predictor_paths:
     ds = rasterio.open(p)
-    assert_same_grid(ds, ref_ds, os.path.basename(p), "REF_MASK")
+    try:
+        assert_same_grid(ds, ref_ds, os.path.basename(p), "REF_MASK")
+    except RuntimeError:
+        # Align mismatched predictors (e.g., AlphaEarth VRT) to the reference grid on the fly.
+        print(f"Grid mismatch for {os.path.basename(p)}; using WarpedVRT to REF grid.")
+        ds = WarpedVRT(
+            ds,
+            crs=ref_crs,
+            transform=ref_transform,
+            width=W,
+            height=H,
+            resampling=Resampling.bilinear,
+        )
     predictors.append((p, ds))
-    norm_mode = "Z-score" if should_normalize(p) else "RAW"
+    norm_flag = should_normalize(p)
+    norm_mode = "Z-score" if norm_flag else "RAW"
     print(f"{os.path.basename(p):45s} bands={ds.count:2d} norm={norm_mode}")
+    if norm_flag:
+        normalized_predictor_files.append(os.path.basename(p))
+    else:
+        raw_predictor_files.append(os.path.basename(p))
+
+print("\n" + "-" * 70)
+print("NORMALIZATION SUMMARY")
+print("-" * 70)
+print("Rules (case-sensitive substrings):")
+for tag in NORMALIZE_IF_NAME_CONTAINS:
+    print(f"  - {tag}")
+print(f"Z-score predictors ({len(normalized_predictor_files)}):")
+for name in normalized_predictor_files:
+    print(f"  - {name}")
+print(f"RAW predictors ({len(raw_predictor_files)}):")
+for name in raw_predictor_files:
+    print(f"  - {name}")
 
 # Build and save channel mapping for downstream training/embeddings
 channel_map = []
@@ -326,7 +457,7 @@ print("\n" + "=" * 70)
 print("COMPUTING Z-SCORE STATS (TOPOGRAPHIC ONLY)")
 print("=" * 70)
 
-z_stats: dict[str, list[tuple[float, float]] | None] = {}
+z_stats: dict[str, Optional[list[tuple[float, float]]]] = {}
 for p, ds in predictors:
     if not should_normalize(p):
         z_stats[p] = None
@@ -356,13 +487,14 @@ tiles_filtered = 0
 tiles_skipped = 0
 metadata = []
 
-row_positions = list(range(0, H, TILE_SIZE))
-total_rows = len(row_positions)
+row_starts = list(range(0, H, STRIDE))
+col_starts = list(range(0, W, STRIDE))
+total_rows = len(row_starts)
 ETA_REPORT_EVERY_ROWS = 25
 run_start_ts = time.time()
 
-for row_idx, row in enumerate(tqdm(row_positions, desc="Rows"), start=1):
-    for col in range(0, W, TILE_SIZE):
+for row_idx, row in enumerate(tqdm(row_starts, desc="Rows"), start=1):
+    for col in col_starts:
         if row + TILE_SIZE > H or col + TILE_SIZE > W:
             tiles_skipped += 1
             continue
@@ -473,9 +605,17 @@ if metadata:
         writer.writeheader()
         writer.writerows(metadata)
 
+preview_pngs = []
+try:
+    preview_pngs = create_end_run_previews([m["tile_id"] for m in metadata])
+except Exception as e:
+    print(f"Preview PNG generation failed: {e}")
+
 print("\nDone.")
 print(f"Tiles created : {tile_id}")
 print(f"Tiles filtered: {tiles_filtered}")
 print(f"Tiles skipped : {tiles_skipped}")
 print(f"Output folder : {OUT_DIR}")
 print(f"Metadata CSV  : {meta_csv if metadata else 'No tiles created'}")
+if preview_pngs:
+    print(f"Preview PNGs : {len(preview_pngs)} in {PREVIEW_DIR}")
