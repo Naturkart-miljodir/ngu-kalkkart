@@ -10,9 +10,12 @@ import os
 import re
 import glob
 import time
+import shutil
 import numpy as np
 from tqdm import tqdm
 import rasterio
+from rasterio.enums import Resampling
+from rasterio.vrt import WarpedVRT
 from rasterio.windows import Window
 from rasterio.features import rasterize
 import geopandas as gpd
@@ -122,25 +125,27 @@ if os.name == "nt":
 else:
     PROJECT_DIR = windows_path_to_wsl(PROJECT_DIR_WINDOWS)
 
-PREDICTOR_DIR = r"C:\Users\acosta_pedro\OneDrive - Norges geologiske undersøkelse\Geochemistry NGU_2026\Kalk_project\Modelling\Covariates_to_model"
-POLYGON_GPKG = r"C:\Users\acosta_pedro\Miljødirektoratet\Endre Grüner Ofstad - kalkkart\Data\kalkkart_treningsdata.gpkg"
+PREDICTOR_DIR = r"G:\Covariates_to_model"
+POLYGON_GPKG = r"C:\Users\acosta_pedro\OneDrive - Norges geologiske undersøkelse\Geochemistry NGU_2025\kalk_prosjekt3.0\MDir_data\Data_2026\kalkkart_treningsdata_ed_June2026.gpkg"
 POLYGON_LAYER = "NiN_all_agg"
-REF_MASK = r"E:\Alpha_earth\qc\alphaearth_mosaic_epsg25833_band1_qc_cog.tif"
-OUT_DIR = r"C:\Users\acosta_pedro\OneDrive - Norges geologiske undersøkelse\Geochemistry NGU_2026\Kalk_project\Modelling\RandForest\Regression"
+REF_MASK = r"G:\Covariates_to_model\Topo_dtm_ch.tif"
+OUT_DIR = r"D:\Classical_ML"
 MATRIX_PATH = os.getenv(
     "RF_MATRIX_PATH",
-    os.path.join(OUT_DIR, "regression_matrix.npz"),
+    os.path.join(OUT_DIR, "regression_matrix_2026_total_with_clean_ed_2.npz"),
 )
 ALPHAEARTH_VRT_NAME = "alphaearth_dequant_national_epsg25833.vrt"
 ALPHAEARTH_DIR = r"E:\Alpha_earth\dequant_images_all"
 
 LABEL_FIELD = "KA_mean_weighted_category"
+STATUS_FIELD = "KA_mean_weighted_category_status"
 BACKGROUND_VALUE = 0
 WINDOW_SIZE = int(os.getenv("RF_WINDOW_SIZE", "1024"))
 ETA_EVERY_WINDOWS = int(os.getenv("RF_ETA_EVERY_WINDOWS", "25"))
 RANDOM_SEED = 42
 _max_samples_raw = os.getenv("RF_MAX_SAMPLES_TOTAL", "").strip()
 MAX_SAMPLES_TOTAL = int(_max_samples_raw) if _max_samples_raw else None
+KEEP_TMP_ARRAYS = os.getenv("RF_KEEP_TMP_ARRAYS", "0").strip() == "1"
 
 np.random.seed(RANDOM_SEED)
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -158,6 +163,9 @@ raster_paths = sorted(
     + glob.glob(os.path.join(PREDICTOR_DIR, "*.vrt"))
 )
 
+# Avoid double-loading AlphaEarth when a pre-patched VRT is present in PREDICTOR_DIR.
+raster_paths = [p for p in raster_paths if not p.lower().endswith("_absolute_paths.vrt")]
+
 alphaearth_vrt = os.path.join(PREDICTOR_DIR, ALPHAEARTH_VRT_NAME)
 if os.path.exists(alphaearth_vrt):
     tmp_vrt_dir = os.path.join(OUT_DIR, "_tmp_vrt")
@@ -167,32 +175,63 @@ if os.path.exists(alphaearth_vrt):
 if not raster_paths:
     raise FileNotFoundError(f"No predictor rasters found in: {PREDICTOR_DIR}")
 
-datasets = [rasterio.open(path) for path in raster_paths]
-for path, ds in zip(raster_paths, datasets):
-    with rasterio.open(REF_MASK) as ref_ds:
-        assert_same_grid(ref_ds, ds, "REF_MASK", os.path.basename(path))
+datasets = []
+with rasterio.open(REF_MASK) as ref_ds:
+    for path in raster_paths:
+        ds = rasterio.open(path)
+        try:
+            assert_same_grid(ref_ds, ds, "REF_MASK", os.path.basename(path))
+        except RuntimeError:
+            print(f"Grid mismatch for {os.path.basename(path)}; using WarpedVRT to REF grid.")
+            ds = WarpedVRT(
+                ds,
+                crs=ref_ds.crs,
+                transform=ref_ds.transform,
+                width=ref_ds.width,
+                height=ref_ds.height,
+                resampling=Resampling.bilinear,
+            )
+        datasets.append(ds)
 
 var_names = dataset_var_names(raster_paths, datasets)
 print(f"Loaded {len(var_names)} predictors")
 
-gdf = gpd.read_file(POLYGON_GPKG, layer=POLYGON_LAYER)
+if POLYGON_LAYER:
+    gdf = gpd.read_file(POLYGON_GPKG, layer=POLYGON_LAYER)
+else:
+    gdf = gpd.read_file(POLYGON_GPKG)
 if gdf.crs != crs:
     gdf = gdf.to_crs(crs)
 
 class_order = ["low", "medium", "high"]
 class_map = {cls: idx + 1 for idx, cls in enumerate(class_order)}
+status_order = ["clean", "dirty"]
+status_map = {cls: idx + 1 for idx, cls in enumerate(status_order)}
 
 if LABEL_FIELD not in gdf.columns:
     raise KeyError(f"Label field '{LABEL_FIELD}' not found in: {POLYGON_GPKG}")
+if STATUS_FIELD not in gdf.columns:
+    raise KeyError(f"Status field '{STATUS_FIELD}' not found in: {POLYGON_GPKG}")
 
 gdf = gdf[gdf.geometry.notnull()]
 gdf = gdf[~gdf.geometry.is_empty]
-gdf = gdf[gdf[LABEL_FIELD].isin(class_order)].copy()
+gdf = gdf[gdf[LABEL_FIELD].isin(class_order)]
+gdf = gdf[gdf[STATUS_FIELD].isin(status_order)].copy()
 gdf["label"] = gdf[LABEL_FIELD].map(class_map).astype(np.uint8)
+gdf["status"] = gdf[STATUS_FIELD].map(status_map).astype(np.uint8)
 
-shapes = [(geom, int(lbl)) for geom, lbl in zip(gdf.geometry, gdf["label"])]
+label_shapes = [(geom, int(lbl)) for geom, lbl in zip(gdf.geometry, gdf["label"])]
+status_shapes = [(geom, int(st)) for geom, st in zip(gdf.geometry, gdf["status"])]
+
 y_raster = rasterize(
-    shapes=shapes,
+    shapes=label_shapes,
+    out_shape=(height, width),
+    transform=transform,
+    fill=BACKGROUND_VALUE,
+    dtype=np.uint8,
+)
+y_status_raster = rasterize(
+    shapes=status_shapes,
     out_shape=(height, width),
     transform=transform,
     fill=BACKGROUND_VALUE,
@@ -207,10 +246,12 @@ print("Rasterized polygons to labels")
 print("Extracting regression matrix pixel data (window-based)...")
 print(f"Labeled pixels total: {total_labeled}")
 
-features_chunks = []
-labels_chunks = []
-rows_chunks = []
-cols_chunks = []
+tmp_chunks_dir = os.path.join(OUT_DIR, f"_tmp_chunks_{int(time.time())}")
+tmp_arrays_dir = os.path.join(OUT_DIR, f"_tmp_arrays_{int(time.time())}")
+os.makedirs(tmp_chunks_dir, exist_ok=True)
+os.makedirs(tmp_arrays_dir, exist_ok=True)
+
+chunk_files = []
 
 window_specs = []
 for row_off in range(0, height, WINDOW_SIZE):
@@ -222,9 +263,11 @@ for row_off in range(0, height, WINDOW_SIZE):
 start_time = time.time()
 processed_labeled = 0
 valid_collected = 0
+chunk_idx = 0
 
 for win_idx, (row_off, col_off, win_h, win_w) in enumerate(tqdm(window_specs), start=1):
     y_block = y_raster[row_off : row_off + win_h, col_off : col_off + win_w]
+    y_status_block = y_status_raster[row_off : row_off + win_h, col_off : col_off + win_w]
     labeled_mask = y_block > 0
     labeled_count = int(labeled_mask.sum())
 
@@ -238,11 +281,12 @@ for win_idx, (row_off, col_off, win_h, win_w) in enumerate(tqdm(window_specs), s
     window = Window(col_off, row_off, win_w, win_h)
 
     for ds in datasets:
-        block = ds.read(window=window).astype(np.float32)
+        with np.errstate(over="ignore", invalid="ignore"):
+            block = ds.read(window=window).astype(np.float32)
         predictor_blocks.append(block)
         all_valid &= nodata_mask_for_dataset(block, ds.nodatavals)
 
-    valid_mask = all_valid
+    valid_mask = all_valid & (y_status_block > 0)
     valid_count = int(valid_mask.sum())
 
     if valid_count == 0:
@@ -253,6 +297,7 @@ for win_idx, (row_off, col_off, win_h, win_w) in enumerate(tqdm(window_specs), s
 
     x_chunk = stacked[:, rr, cc].T.astype(np.float32, copy=False)
     y_chunk = y_block[rr, cc].astype(np.int16, copy=False)
+    y_status_chunk = y_status_block[rr, cc].astype(np.int16, copy=False)
     row_chunk = (rr + row_off).astype(np.int32, copy=False)
     col_chunk = (cc + col_off).astype(np.int32, copy=False)
 
@@ -264,13 +309,21 @@ for win_idx, (row_off, col_off, win_h, win_w) in enumerate(tqdm(window_specs), s
             select_idx = np.random.choice(x_chunk.shape[0], size=remaining, replace=False)
             x_chunk = x_chunk[select_idx]
             y_chunk = y_chunk[select_idx]
+            y_status_chunk = y_status_chunk[select_idx]
             row_chunk = row_chunk[select_idx]
             col_chunk = col_chunk[select_idx]
 
-    features_chunks.append(x_chunk)
-    labels_chunks.append(y_chunk)
-    rows_chunks.append(row_chunk)
-    cols_chunks.append(col_chunk)
+    chunk_path = os.path.join(tmp_chunks_dir, f"chunk_{chunk_idx:06d}.npz")
+    np.savez_compressed(
+        chunk_path,
+        X=x_chunk,
+        y=y_chunk,
+        y_status=y_status_chunk,
+        rows=row_chunk,
+        cols=col_chunk,
+    )
+    chunk_files.append(chunk_path)
+    chunk_idx += 1
 
     valid_collected += x_chunk.shape[0]
 
@@ -287,30 +340,96 @@ for win_idx, (row_off, col_off, win_h, win_w) in enumerate(tqdm(window_specs), s
     if MAX_SAMPLES_TOTAL is not None and valid_collected >= MAX_SAMPLES_TOTAL:
         break
 
-if not features_chunks:
+if not chunk_files:
     for ds in datasets:
         ds.close()
+    shutil.rmtree(tmp_chunks_dir, ignore_errors=True)
+    shutil.rmtree(tmp_arrays_dir, ignore_errors=True)
     raise RuntimeError("No valid labeled samples found. Check raster alignment and NoData values.")
 
-X_all = np.concatenate(features_chunks, axis=0)
-y_all = np.concatenate(labels_chunks, axis=0)
-rows_arr = np.concatenate(rows_chunks, axis=0)
-cols_arr = np.concatenate(cols_chunks, axis=0)
+total_samples = valid_collected
+num_features = len(var_names)
+
+X_memmap_path = os.path.join(tmp_arrays_dir, "X_all.npy")
+y_memmap_path = os.path.join(tmp_arrays_dir, "y_all.npy")
+y_status_memmap_path = os.path.join(tmp_arrays_dir, "y_status_all.npy")
+rows_memmap_path = os.path.join(tmp_arrays_dir, "rows_all.npy")
+cols_memmap_path = os.path.join(tmp_arrays_dir, "cols_all.npy")
+
+X_all = np.lib.format.open_memmap(
+    X_memmap_path, mode="w+", dtype=np.float32, shape=(total_samples, num_features)
+)
+y_all = np.lib.format.open_memmap(y_memmap_path, mode="w+", dtype=np.int16, shape=(total_samples,))
+y_status_all = np.lib.format.open_memmap(
+    y_status_memmap_path, mode="w+", dtype=np.int16, shape=(total_samples,)
+)
+rows_arr = np.lib.format.open_memmap(rows_memmap_path, mode="w+", dtype=np.int32, shape=(total_samples,))
+cols_arr = np.lib.format.open_memmap(cols_memmap_path, mode="w+", dtype=np.int32, shape=(total_samples,))
+
+write_offset = 0
+for chunk_path in tqdm(chunk_files, desc="Assembling memmaps"):
+    with np.load(chunk_path, allow_pickle=False) as chunk:
+        n = chunk["y"].shape[0]
+        next_offset = write_offset + n
+        X_all[write_offset:next_offset, :] = chunk["X"]
+        y_all[write_offset:next_offset] = chunk["y"]
+        y_status_all[write_offset:next_offset] = chunk["y_status"]
+        rows_arr[write_offset:next_offset] = chunk["rows"]
+        cols_arr[write_offset:next_offset] = chunk["cols"]
+        write_offset = next_offset
+
+if write_offset != total_samples:
+    for ds in datasets:
+        ds.close()
+    raise RuntimeError(
+        f"Assembled sample count mismatch: expected {total_samples}, got {write_offset}"
+    )
+
+del chunk_files
+shutil.rmtree(tmp_chunks_dir, ignore_errors=True)
+
+X_all.flush()
+y_all.flush()
+y_status_all.flush()
+rows_arr.flush()
+cols_arr.flush()
 
 print(f"Valid samples in matrix: {len(y_all)}")
 print(f"Class distribution: {np.bincount(y_all)}")
+print(f"Status distribution (1=clean, 2=dirty): {np.bincount(y_status_all)}")
 print(f"X shape: {X_all.shape}")
 
 np.savez_compressed(
     MATRIX_PATH,
     X=X_all,
     y=y_all,
+    y_status=y_status_all,
     rows=rows_arr,
     cols=cols_arr,
     var_names=np.array(var_names, dtype=object),
+    class_order=np.array(class_order, dtype=object),
+    status_order=np.array(status_order, dtype=object),
     width=np.array([width], dtype=np.int32),
     height=np.array([height], dtype=np.int32),
+    transform=np.array(
+        [
+            transform.a,
+            transform.b,
+            transform.c,
+            transform.d,
+            transform.e,
+            transform.f,
+        ],
+        dtype=np.float64,
+    ),
+    crs_wkt=np.array([crs.to_wkt() if crs is not None else ""], dtype=object),
+    ref_mask=np.array([REF_MASK], dtype=object),
 )
+
+if not KEEP_TMP_ARRAYS:
+    shutil.rmtree(tmp_arrays_dir, ignore_errors=True)
+else:
+    print(f"Kept temporary arrays in: {tmp_arrays_dir}")
 
 for ds in datasets:
     ds.close()
