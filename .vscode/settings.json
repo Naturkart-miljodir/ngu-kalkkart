@@ -27,6 +27,9 @@
   ],
   "autoDocstring.docstringFormat": "one-line-sphinx",
   "python.useEnvironmentsExtension": false, // Use Python Envy instead
+  "python.analysis.diagnosticSeverityOverrides": {
+    "reportMissingTypeStubs": "none"
+  },
 
   // YAML formatting
   "[yaml]": {
