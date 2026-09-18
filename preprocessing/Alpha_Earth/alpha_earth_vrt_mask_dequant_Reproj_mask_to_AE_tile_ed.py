@@ -1,7 +1,10 @@
 # pyright: reportMissingImports=false, reportMissingModuleSource=false
 
 import argparse
+import builtins
 import json
+import time
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -11,6 +14,8 @@ from rasterio.crs import CRS
 from rasterio.enums import Resampling
 from rasterio.transform import array_bounds
 from rasterio.warp import calculate_default_transform, reproject
+
+print = partial(builtins.print, flush=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=Path(r"E:\Alpha_earth"),
+        default=Path(r"E:\Alpha_earth\Test"),
         help="Output root folder.",
     )
     parser.add_argument(
@@ -131,6 +136,185 @@ def discover_zone_rasters(zone_dir: Path) -> list[Path]:
     return rasters
 
 
+def rasters_are_aligned(ds1, ds2, tol=1e-9) -> bool:
+    return (
+        ds1.crs == ds2.crs
+        and ds1.width == ds2.width
+        and ds1.height == ds2.height
+        and all(abs(a - b) <= tol for a, b in zip(ds1.transform, ds2.transform))
+    )
+
+
+def build_zone_grid(raster_paths: list[Path], tol: float = 1e-6):
+    if not raster_paths:
+        raise ValueError("No raster paths provided for zone grid build")
+
+    with rasterio.open(raster_paths[0]) as base_ds:
+        if base_ds.crs is None:
+            raise ValueError(f"Source CRS missing: {raster_paths[0]}")
+        if abs(base_ds.transform.b) > tol or abs(base_ds.transform.d) > tol:
+            raise ValueError("Rotated grids are not supported for zone mask caching")
+
+        base_transform = base_ds.transform
+        base_crs = base_ds.crs
+        inv_base = ~base_transform
+        min_col, min_row = 0, 0
+        max_col, max_row = base_ds.width, base_ds.height
+
+        for raster_path in raster_paths[1:]:
+            with rasterio.open(raster_path) as ds:
+                if ds.crs != base_crs:
+                    raise ValueError(f"Zone contains mixed CRS rasters: {raster_path}")
+                if abs(ds.transform.b) > tol or abs(ds.transform.d) > tol:
+                    raise ValueError(f"Rotated grid not supported: {raster_path}")
+                if abs(ds.transform.a - base_transform.a) > tol or abs(ds.transform.e - base_transform.e) > tol:
+                    raise ValueError(f"Zone contains mixed resolutions: {raster_path}")
+
+                x0, y0 = ds.transform * (0, 0)
+                x1, y1 = ds.transform * (ds.width, ds.height)
+                c0, r0 = inv_base * (x0, y0)
+                c1, r1 = inv_base * (x1, y1)
+
+                values = [c0, c1, r0, r1]
+                if any(abs(v - round(v)) > tol for v in values):
+                    raise ValueError(f"Zone tiles are not aligned to a shared grid: {raster_path}")
+
+                cols = sorted([int(round(c0)), int(round(c1))])
+                rows = sorted([int(round(r0)), int(round(r1))])
+                min_col = min(min_col, cols[0])
+                max_col = max(max_col, cols[1])
+                min_row = min(min_row, rows[0])
+                max_row = max(max_row, rows[1])
+
+    zone_transform = base_transform * Affine.translation(min_col, min_row)
+    zone_width = int(max_col - min_col)
+    zone_height = int(max_row - min_row)
+    return zone_transform, zone_width, zone_height, base_crs
+
+
+def align_mask_to_zone(
+    mask_path: Path,
+    zone_name: str,
+    zone_raster_paths: list[Path],
+    zone_mask_path: Path,
+    mask_threshold: float,
+    overwrite: bool,
+) -> None:
+    if zone_mask_path.exists() and not overwrite:
+        print(f"[MASK CACHE] Reusing cached zone mask: {zone_mask_path.name}")
+        return
+
+    zone_mask_path.parent.mkdir(parents=True, exist_ok=True)
+    zone_transform, zone_width, zone_height, zone_crs = build_zone_grid(zone_raster_paths)
+
+    with rasterio.open(zone_raster_paths[0]) as ref_ds, rasterio.open(mask_path) as mask_ds:
+        print(f"[MASK CACHE] Building cached zone mask for {zone_name} ({len(zone_raster_paths)} tiles)")
+
+        destination = np.zeros((zone_height, zone_width), dtype=np.float32)
+        reproject(
+            source=rasterio.band(mask_ds, 1),
+            destination=destination,
+            src_transform=mask_ds.transform,
+            src_crs=mask_ds.crs,
+            src_nodata=mask_ds.nodata,
+            dst_transform=zone_transform,
+            dst_crs=zone_crs,
+            dst_nodata=0,
+            resampling=Resampling.nearest,
+        )
+
+        keep = np.isfinite(destination) & (destination > mask_threshold)
+        out = keep.astype(np.uint8)
+
+        profile = ref_ds.profile.copy()
+        profile.update(
+            count=1,
+            dtype="uint8",
+            nodata=0,
+            compress="deflate",
+            predictor=2,
+            tiled=True,
+            blockxsize=256,
+            blockysize=256,
+            crs=zone_crs,
+            transform=zone_transform,
+            height=zone_height,
+            width=zone_width,
+        )
+
+        with rasterio.open(zone_mask_path, "w", **profile) as out_ds:
+            out_ds.write(out, 1)
+
+
+def zone_mask_window_for_reference(zone_mask_ds, reference_ds, tol: float = 1e-6):
+    if zone_mask_ds.crs != reference_ds.crs:
+        return None
+    if abs(zone_mask_ds.transform.a - reference_ds.transform.a) > tol:
+        return None
+    if abs(zone_mask_ds.transform.e - reference_ds.transform.e) > tol:
+        return None
+    if abs(zone_mask_ds.transform.b) > tol or abs(zone_mask_ds.transform.d) > tol:
+        return None
+    if abs(reference_ds.transform.b) > tol or abs(reference_ds.transform.d) > tol:
+        return None
+
+    inv_zone = ~zone_mask_ds.transform
+    x0, y0 = reference_ds.transform * (0, 0)
+    x1, y1 = reference_ds.transform * (reference_ds.width, reference_ds.height)
+    c0, r0 = inv_zone * (x0, y0)
+    c1, r1 = inv_zone * (x1, y1)
+
+    values = [c0, c1, r0, r1]
+    if any(abs(v - round(v)) > tol for v in values):
+        return None
+
+    cols = sorted([int(round(c0)), int(round(c1))])
+    rows = sorted([int(round(r0)), int(round(r1))])
+    return rows[0], rows[1], cols[0], cols[1]
+
+
+def extract_tile_mask_from_zone(
+    zone_mask_path: Path,
+    reference_raster_path: Path,
+    aligned_mask_path: Path,
+    overwrite: bool,
+) -> bool:
+    if aligned_mask_path.exists() and not overwrite:
+        print(f"[MASK CHECK] Skipping existing aligned mask: {aligned_mask_path.name} (alignment not re-checked)")
+        return True
+
+    aligned_mask_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with rasterio.open(reference_raster_path) as ref_ds, rasterio.open(zone_mask_path) as zone_mask_ds:
+        window_idx = zone_mask_window_for_reference(zone_mask_ds, ref_ds)
+        if window_idx is None:
+            return False
+
+        row0, row1, col0, col1 = window_idx
+        data = zone_mask_ds.read(1, window=((row0, row1), (col0, col1)))
+        if data.shape != (ref_ds.height, ref_ds.width):
+            return False
+
+        print(f"[MASK CHECK] Match: YES - using cached zone mask for {reference_raster_path.name}")
+
+        profile = ref_ds.profile.copy()
+        profile.update(
+            count=1,
+            dtype="uint8",
+            nodata=0,
+            compress="deflate",
+            predictor=2,
+            tiled=True,
+            blockxsize=256,
+            blockysize=256,
+        )
+
+        with rasterio.open(aligned_mask_path, "w", **profile) as out_ds:
+            out_ds.write(data.astype(np.uint8, copy=False), 1)
+
+    return True
+
+
 def align_mask_to_reference(
     mask_path: Path,
     reference_raster_path: Path,
@@ -139,11 +323,17 @@ def align_mask_to_reference(
     overwrite: bool,
 ) -> None:
     if aligned_mask_path.exists() and not overwrite:
+        print(f"[MASK CHECK] Skipping existing aligned mask: {aligned_mask_path.name} (alignment not re-checked)")
         return
 
     aligned_mask_path.parent.mkdir(parents=True, exist_ok=True)
 
     with rasterio.open(reference_raster_path) as ref_ds, rasterio.open(mask_path) as mask_ds:
+        if rasters_are_aligned(mask_ds, ref_ds):
+            print(f"[MASK CHECK] Match: YES - mask aligned with {reference_raster_path.name}")
+        else:
+            print(f"[MASK CHECK] Match: NO (No match) - reprojecting/aligning mask to {reference_raster_path.name}")
+
         source = rasterio.band(mask_ds, 1)
         destination = np.zeros((ref_ds.height, ref_ds.width), dtype=np.float32)
 
@@ -311,6 +501,33 @@ def sanitize_crs_tag(crs_text: str) -> str:
     return crs_text.lower().replace(":", "")
 
 
+def format_duration(seconds: float) -> str:
+    total_seconds = max(0, int(round(seconds)))
+    hours, rem = divmod(total_seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def print_progress(done: int, total: int, start_ts: float) -> None:
+    if total <= 0:
+        return
+
+    elapsed = time.time() - start_ts
+    rate = done / elapsed if elapsed > 0 else 0.0
+    remaining = max(total - done, 0)
+    eta = (remaining / rate) if rate > 0 else 0.0
+
+    frac = min(max(done / total, 0.0), 1.0)
+    bar_width = 28
+    filled = int(round(bar_width * frac))
+    bar = "#" * filled + "-" * (bar_width - filled)
+
+    print(
+        f"[PROGRESS] |{bar}| {done}/{total} ({frac * 100:5.1f}%) "
+        f"elapsed={format_duration(elapsed)} eta={format_duration(eta)}"
+    )
+
+
 def expected_dequant_output_path(
     deq_image_dir: Path,
     zone_name: str,
@@ -388,6 +605,10 @@ def main() -> None:
         raise FileNotFoundError(f"Mask raster not found: {args.mask_path}")
 
     zone_dirs = discover_zone_dirs(args.alpha_root, args.zones)
+    zone_rasters_map = {zone_dir: discover_zone_rasters(zone_dir) for zone_dir in zone_dirs}
+    total_rasters = sum(len(rasters) for rasters in zone_rasters_map.values())
+    processed_rasters = 0
+    progress_start_ts = time.time()
 
     aligned_mask_dir = args.output_root / "mask_aligned"
     deq_image_dir = args.output_root / "dequant_images_all"
@@ -403,7 +624,8 @@ def main() -> None:
         zone_name = zone_dir.name
         print(f"\n=== Processing zone folder: {zone_name} ===")
 
-        rasters = discover_zone_rasters(zone_dir)
+        rasters = zone_rasters_map[zone_dir]
+        zone_mask_path = aligned_mask_dir / f"mask_to_{zone_name}_zone.tif"
 
         if not args.overwrite:
             expected_outputs = [
@@ -412,21 +634,49 @@ def main() -> None:
             if expected_outputs and all(p.exists() for p in expected_outputs):
                 print(f"Zone {zone_name}: all de-quantized images already exist, skipping zone.")
                 all_deq_images.extend(expected_outputs)
+                processed_rasters += len(rasters)
+                print_progress(processed_rasters, total_rasters, progress_start_ts)
                 continue
 
         zone_written = 0
         zone_skipped = 0
 
-        for source_raster in rasters:
-            source_tag = source_raster.stem
-            aligned_mask_path = aligned_mask_dir / f"mask_to_{zone_name}_{source_tag}.tif"
-            align_mask_to_reference(
+        try:
+            align_mask_to_zone(
                 mask_path=args.mask_path,
-                reference_raster_path=source_raster,
-                aligned_mask_path=aligned_mask_path,
+                zone_name=zone_name,
+                zone_raster_paths=rasters,
+                zone_mask_path=zone_mask_path,
                 mask_threshold=args.mask_threshold,
                 overwrite=args.overwrite,
             )
+            use_zone_cache = True
+        except Exception as exc:
+            print(f"[MASK CACHE] Zone cache unavailable for {zone_name}: {exc}")
+            print("[MASK CACHE] Falling back to per-tile mask reprojection.")
+            use_zone_cache = False
+
+        for source_raster in rasters:
+            source_tag = source_raster.stem
+            aligned_mask_path = aligned_mask_dir / f"mask_to_{zone_name}_{source_tag}.tif"
+            if use_zone_cache:
+                extracted = extract_tile_mask_from_zone(
+                    zone_mask_path=zone_mask_path,
+                    reference_raster_path=source_raster,
+                    aligned_mask_path=aligned_mask_path,
+                    overwrite=args.overwrite,
+                )
+            else:
+                extracted = False
+
+            if not extracted:
+                align_mask_to_reference(
+                    mask_path=args.mask_path,
+                    reference_raster_path=source_raster,
+                    aligned_mask_path=aligned_mask_path,
+                    mask_threshold=args.mask_threshold,
+                    overwrite=args.overwrite,
+                )
 
             out_image_path = expected_dequant_output_path(
                 deq_image_dir, zone_name, source_raster, target_crs
@@ -455,6 +705,9 @@ def main() -> None:
                     **result,
                 }
             )
+
+            processed_rasters += 1
+            print_progress(processed_rasters, total_rasters, progress_start_ts)
 
         print(f"Zone {zone_name}: dequant images written={zone_written}, skipped(existing)={zone_skipped}")
 
