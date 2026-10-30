@@ -1,0 +1,27 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run DL_Unet_GPU_embeddings_desktop_SpCV.py with conda",
+			"type": "shell",
+			"command": "conda activate kalk_unet && python deep_learning/u_net/DL_Unet_GPU_embeddings_desktop_SpCV.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run DL_Unet_emb_desk_simply.py with conda",
+			"type": "shell",
+			"command": "conda activate kalk_unet && python deep_learning/u_net/DL_Unet_emb_desk_simply.py",
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Run DL_Unet_emb_desk_simply.py with conda",
+			"type": "shell",
+			"command": "conda activate kalk_unet && python deep_learning/u_net/DL_Unet_emb_desk_simply.py",
+			"isBackground": false,
+			"group": "build"
+		}
+	]
+}

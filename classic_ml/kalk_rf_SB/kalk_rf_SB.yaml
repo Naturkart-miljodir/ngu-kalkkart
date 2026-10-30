@@ -1,0 +1,23 @@
+# kalk_rf_SB environment for classic_ml
+# To create this environment on another machine:
+#   conda env create -f kalk_rf_SB.yaml
+#
+# To activate:
+#   conda activate kalk_rf_SB
+
+name: kalk_rf_SB
+dependencies:
+  - python=3.10
+  - numpy
+  - pandas
+  - scikit-learn
+  - matplotlib
+  - geopandas
+  - affine
+  - joblib
+  - cudf  # for RAPIDS GPU support (optional, only if GPU available)
+  - cuml  # for RAPIDS GPU support (optional, only if GPU available)
+  - pip
+  - pip:
+      - --extra-index-url=https://pypi.org/simple
+      # Add any pip-only dependencies here
